@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Genie · external app as the Entra user</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1b1f24; --muted:#5f6b7a; --line:#e3e6ea; --accent:#ff3621; --ok:#1f8a4c; --warn:#b26b00; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:var(--card); border-bottom:1px solid var(--line); }
+  header h1 { font-size:17px; margin:0; }
+  main { display:grid; grid-template-columns: 1fr 360px; gap:16px; padding:16px 24px; max-width:1300px; margin:auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .muted { color:var(--muted); font-size:13px; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; border-radius:8px; padding:7px 12px; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  #chat { min-height:380px; max-height:62vh; overflow:auto; display:flex; flex-direction:column; gap:12px; }
+  .q { align-self:flex-end; background:#eef2f7; border-radius:10px; padding:8px 12px; max-width:80%; }
+  .a { border-left:3px solid var(--accent); padding:4px 12px; }
+  .status { font-size:12px; color:var(--muted); }
+  pre { background:#f3f4f6; padding:8px; border-radius:6px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+  table { border-collapse:collapse; font-size:13px; margin-top:6px; }
+  th, td { border:1px solid var(--line); padding:4px 8px; text-align:left; }
+  form { display:flex; gap:8px; margin-top:12px; }
+  input[type=text] { flex:1; font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:8px; }
+  #events li { font-size:12px; margin-bottom:4px; }
+  .ev-warn { color:var(--warn); } .ev-ok { color:var(--ok); }
+  dl { display:grid; grid-template-columns:110px 1fr; gap:2px 8px; font-size:12px; margin:8px 0 0; }
+  dt { color:var(--muted); } dd { margin:0; word-break:break-all; }
+  .fb { display:flex; gap:6px; align-items:center; margin-top:8px; flex-wrap:wrap; }
+  .fb button[aria-pressed="true"] { border-color:var(--accent); background:#fff1ef; }
+  .fb input { flex:1; min-width:200px; font:inherit; padding:5px 8px; border:1px solid var(--line); border-radius:8px; }
+  #login-view { max-width:520px; margin:80px auto; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Genie · external app calling as the signed-in Entra user</h1>
+  <div id="user" class="muted"></div>
+</header>
+
+<div id="login-view" class="card" hidden>
+  <h2>Sign in</h2>
+  <p class="muted">One Entra sign-in. The backend keeps the tokens and refreshes them; the browser only holds a session cookie.</p>
+  <a href="/auth/login"><button class="primary">Sign in with Microsoft</button></a>
+</div>
+
+<main id="app-view" hidden>
+  <section class="card">
+    <div id="chat"></div>
+    <form id="ask">
+      <input type="text" id="question" placeholder="Ask about claims, e.g. How many claims are there by region?" autocomplete="off" maxlength="2000">
+      <button class="primary" id="send">Ask</button>
+      <button type="button" id="new">New chat</button>
+    </form>
+  </section>
+  <aside class="card">
+    <strong>Identity and token</strong>
+    <dl id="claims"></dl>
+    <div style="display:flex; gap:8px; margin-top:12px;">
+      <button id="refresh-who">Who am I</button>
+      <button id="expire">Simulate token expiry</button>
+    </div>
+    <p class="muted" style="margin-top:14px;">Auth events</p>
+    <ul id="events"></ul>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let conversationId = null;
+
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+
+function logEvents(list) {
+  (list || []).forEach((t) => {
+    const li = el("li", /rejected|simulated/.test(t) ? "ev-warn" : "ev-ok", `${new Date().toLocaleTimeString()} · ${t}`);
+    $("events").prepend(li);
+  });
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { credentials: "same-origin", headers: { "Content-Type": "application/json" }, ...opts });
+  if (r.status === 401) { showLogin(); throw new Error("Session expired, sign in again"); }
+  const raw = await r.text();
+  let data = {}; try { data = JSON.parse(raw); } catch (_) {}
+  if (!r.ok) throw new Error(data.detail || `HTTP ${r.status} ${raw.slice(0, 120)}`);
+  logEvents(data.auth_events);
+  return data;
+}
+
+function showLogin() { $("login-view").hidden = false; $("app-view").hidden = true; }
+
+async function whoami() {
+  const d = await api("/api/whoami");
+  const dl = $("claims"); dl.replaceChildren();
+  const rows = { "Databricks user": d.databricks_user, ...d.token_claims };
+  Object.entries(rows).forEach(([k, v]) => { dl.append(el("dt", null, k), el("dd", null, typeof v === "object" ? JSON.stringify(v) : String(v))); });
+}
+
+function renderTable(cols, rows) {
+  const t = el("table"); const tr = el("tr");
+  cols.forEach((c) => tr.append(el("th", null, c))); t.append(tr);
+  rows.forEach((r) => { const row = el("tr"); r.forEach((v) => row.append(el("td", null, v ?? ""))); t.append(row); });
+  return t;
+}
+
+// Thumbs up/down sent to Genie as the user; clicking the active rating clears it (NONE).
+function feedbackBar(convId, msgId, current) {
+  const bar = el("div", "fb"), note = el("span", "muted", "");
+  const up = el("button", null, "👍"), down = el("button", null, "👎");
+  const box = Object.assign(el("input"), { placeholder: "What was wrong? (optional)", maxLength: 1000, hidden: true });
+  const save = Object.assign(el("button", null, "Send"), { hidden: true });
+  up.setAttribute("aria-label", "Helpful"); down.setAttribute("aria-label", "Not helpful");
+  let rating = current && current !== "NONE" ? current : "NONE";
+  const paint = () => { up.setAttribute("aria-pressed", rating === "POSITIVE"); down.setAttribute("aria-pressed", rating === "NEGATIVE"); };
+  async function send(r, comment) {
+    try {
+      await api(`/api/genie/messages/${convId}/${msgId}/feedback`, { method: "POST", body: JSON.stringify({ rating: r, comment }) });
+      rating = r; paint(); note.textContent = r === "NONE" ? "Feedback cleared" : "Thanks, feedback sent to Genie";
+    } catch (e) { note.textContent = e.message; }
+  }
+  up.addEventListener("click", () => { box.hidden = save.hidden = true; send(rating === "POSITIVE" ? "NONE" : "POSITIVE"); });
+  down.addEventListener("click", () => {
+    if (rating === "NEGATIVE") { box.hidden = save.hidden = true; return send("NONE"); }
+    box.hidden = save.hidden = false; box.focus(); send("NEGATIVE");
+  });
+  save.addEventListener("click", () => { send("NEGATIVE", box.value.trim() || undefined); box.hidden = save.hidden = true; });
+  paint(); bar.append(up, down, box, save, note);
+  return bar;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function ask(question) {
+  $("chat").append(el("div", "q", question));
+  const ans = el("div", "a"); const st = el("div", "status", "Sending…"); ans.append(st); $("chat").append(ans);
+  $("send").disabled = true;
+  try {
+    const start = await api("/api/genie/ask", { method: "POST", body: JSON.stringify({ question, conversation_id: conversationId }) });
+    conversationId = start.conversation_id;
+    // Docs: poll every 1-5 s with exponential backoff (max 1 min between polls), stop after 10 min.
+    let delay = 2000, res;
+    const t0 = Date.now(), POLL_LIMIT_MS = 10 * 60 * 1000, MAX_DELAY_MS = 15000;
+    while (true) {
+      res = await api(`/api/genie/messages/${start.conversation_id}/${start.message_id}`);
+      st.textContent = `${res.status} · ${Math.round((Date.now() - t0) / 1000)} s`;
+      if (["COMPLETED", "FAILED", "CANCELLED", "QUERY_RESULT_EXPIRED"].includes(res.status)) break;
+      if (Date.now() - t0 > POLL_LIMIT_MS) { res = { text: "Genie did not finish in 10 minutes. Try again later; the conversation is kept." }; break; }
+      await sleep(delay); delay = Math.min(delay * 1.5, MAX_DELAY_MS);
+    }
+    if (res.text) ans.append(el("p", null, res.text));
+    if (res.sql) { const d = el("details"); d.append(el("summary", "muted", "SQL generated by Genie"), el("pre", null, res.sql)); ans.append(d); }
+    if (res.columns) ans.append(renderTable(res.columns, res.rows || []));
+    if (res.status === "COMPLETED") ans.append(feedbackBar(start.conversation_id, start.message_id, res.feedback));
+  } catch (e) {
+    ans.append(el("p", "ev-warn", e.message));
+  } finally {
+    $("send").disabled = false; $("chat").scrollTop = $("chat").scrollHeight;
+  }
+}
+
+$("ask").addEventListener("submit", (e) => { e.preventDefault(); const q = $("question").value.trim(); if (q) { $("question").value = ""; ask(q); } });
+$("new").addEventListener("click", () => { conversationId = null; $("chat").replaceChildren(); });
+$("refresh-who").addEventListener("click", () => whoami().catch((e) => logEvents([e.message])));
+$("expire").addEventListener("click", async () => { await api("/api/debug/expire", { method: "POST" }); logEvents(["next call will send an expired token"]); });
+
+(async () => {
+  const r = await fetch("/api/me", { credentials: "same-origin" });
+  if (r.status !== 200) return showLogin();
+  const u = await r.json();
+  const out = Object.assign(el("form"), { method: "post", action: "/auth/logout" });
+  out.style.display = "inline"; out.append(Object.assign(el("button", null, "Sign out"), { type: "submit" }));
+  $("user").replaceChildren(el("span", null, `${u.name} · ${u.email} · `), out);
+  if (!u.debug) $("expire").hidden = true;
+  $("app-view").hidden = false;
+  whoami().catch((e) => logEvents([e.message]));
+})();
+</script>
+</body>
+</html>
